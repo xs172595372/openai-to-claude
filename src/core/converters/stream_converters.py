@@ -50,6 +50,8 @@ class StreamState:
         self.thinking_finish = False
         # 内容块索引
         self.content_index = 0
+        # 当前是否有已开始但未结束的内容块
+        self.content_block_open = False
         self.buffer = ""
         # 思考内容模式 None 无 1 <think> 2 reasoning_content
         self.thinking_mode = None
@@ -130,6 +132,7 @@ def process_regular_content(delta: dict[str, Any], state: StreamState) -> list[s
                 content_block_start.model_dump(exclude_none=True),
             )
         )
+        state.content_block_open = True
         # ping 事件
         events.append(
             format_event(AnthropicStreamEventTypes.PING, AnthropicPing().model_dump())
@@ -177,6 +180,7 @@ def process_thinking_content(delta: dict[str, Any], state: StreamState) -> list[
                 content_block_start.model_dump(exclude_none=True),
             )
         )
+        state.content_block_open = True
         events.append(
             format_event(AnthropicStreamEventTypes.PING, AnthropicPing().model_dump())
         )
@@ -241,6 +245,7 @@ def process_thinking_content(delta: dict[str, Any], state: StreamState) -> list[
                 content_block_stop.model_dump(exclude_none=True),
             )
         )
+        state.content_block_open = False
         state.content_index += 1
         return events
     return events
@@ -268,7 +273,7 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
             )
 
             # 如果不是第一个内容块，先结束上一个
-            if new_content_block_index != 0:
+            if new_content_block_index != 0 and state.content_block_open:
                 content_block_stop = AnthropicStreamContentBlockStop(
                     index=state.content_index,
                 )
@@ -278,6 +283,7 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
                         content_block_stop.model_dump(exclude_none=True),
                     )
                 )
+                state.content_block_open = False
                 state.content_index += 1
 
             # 记录映射关系
@@ -314,6 +320,7 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
                     content_block_start.model_dump(exclude_none=True),
                 )
             )
+            state.content_block_open = True
             events.append(
                 format_event(
                     AnthropicStreamEventTypes.PING, AnthropicPing().model_dump()
@@ -410,17 +417,18 @@ def process_finish_event(
     events = []
     state.has_finished = True
 
-    # 结束最后一个内容块
-    # if state.content_started or state.tool_call_chunks > 0:
-    content_block_stop = AnthropicStreamContentBlockStop(
-        index=state.content_index,
-    )
-    events.append(
-        format_event(
-            AnthropicStreamEventTypes.CONTENT_BLOCK_STOP,
-            content_block_stop.model_dump(exclude_none=True),
+    # 只结束已经开始且仍然打开的内容块，避免生成非法的 stop-only 内容块序列。
+    if state.content_block_open:
+        content_block_stop = AnthropicStreamContentBlockStop(
+            index=state.content_index,
         )
-    )
+        events.append(
+            format_event(
+                AnthropicStreamEventTypes.CONTENT_BLOCK_STOP,
+                content_block_stop.model_dump(exclude_none=True),
+            )
+        )
+        state.content_block_open = False
 
     # 映射停止原因
     stop_reason_mapping = {

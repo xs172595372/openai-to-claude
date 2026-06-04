@@ -274,15 +274,34 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
             # 流式响应 - 优化配置确保真正的流式效果
             async def stream_wrapper():
                 """包装器确保流式响应的立即传输"""
+                stream = handler.process_stream_message(
+                    anthropic_request, request_id=request_id
+                )
+                next_chunk_task = asyncio.create_task(stream.__anext__())
+
                 try:
-                    async for chunk in handler.process_stream_message(
-                        anthropic_request, request_id=request_id
-                    ):
+                    while True:
+                        done, _ = await asyncio.wait(
+                            {next_chunk_task}, timeout=5.0
+                        )
+                        if not done:
+                            yield b'event: ping\ndata: {"type":"ping"}\n\n'
+                            await asyncio.sleep(0)
+                            continue
+
+                        try:
+                            chunk = next_chunk_task.result()
+                        except StopAsyncIteration:
+                            break
+
                         # 立即传输每个chunk，不缓冲
                         # chunk已经是完整的SSE格式字符串，编码后返回
                         yield chunk.encode("utf-8")
                         # 强制刷新缓冲区（在某些环境中有效）
                         await asyncio.sleep(0)
+                        next_chunk_task = asyncio.create_task(stream.__anext__())
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     # 如果流式处理出错，记录完整错误并发送错误事件
                     bound_logger.exception(f"流式处理出错 - Error: {str(e)}")
@@ -291,6 +310,14 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
                         error_data["request_id"] = request_id
                     error_event = f"event: error\ndata: {json.dumps(error_data)}\n\n"
                     yield error_event.encode("utf-8")
+                finally:
+                    if not next_chunk_task.done():
+                        next_chunk_task.cancel()
+                        try:
+                            await next_chunk_task
+                        except (asyncio.CancelledError, StopAsyncIteration):
+                            pass
+                    await stream.aclose()
 
             return StreamingResponse(
                 stream_wrapper(),
