@@ -1,3 +1,4 @@
+from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from typing import Any
 
@@ -9,13 +10,17 @@ from src.core.clients.openai_client import OpenAIServiceClient
 router = APIRouter()
 
 
-async def get_openai_client() -> OpenAIServiceClient:
+async def get_openai_client() -> AsyncGenerator[OpenAIServiceClient, None]:
     """获取OpenAI客户端实例"""
     config = await Config.from_file()
-    return OpenAIServiceClient(
+    client = OpenAIServiceClient(
         api_key=config.openai.api_key,
         base_url=config.openai.base_url,
     )
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
 
 @router.get("/health", tags=["health"])

@@ -58,6 +58,10 @@ class MessagesHandler:
         )
         return instance
 
+    async def aclose(self):
+        """关闭处理器持有的上游客户端连接池。"""
+        await self.client.aclose()
+
     async def process_message(
         self, request: AnthropicRequest, request_id: str = None
     ) -> AnthropicMessageResponse:
@@ -166,16 +170,20 @@ class MessagesHandler:
             async def openai_stream_generator():
                 bound_logger.info("开始OpenAI流式生成")
                 chunk_count = 0
-                async for chunk in self.client.send_streaming_request(
+                upstream_stream = self.client.send_streaming_request(
                     openai_request, request_id=request_id
-                ):
-                    # 跳过被解析器过滤掉的不完整chunk（通常是tool_calls片段）
-                    if chunk is not None:
-                        chunk_count += 1
-                        # 将 OpenAI 响应对象转换为字符串格式
-                        bound_logger.debug(f"OpenAI event: {chunk}")
-                        yield f"{chunk}\n\n"
-                bound_logger.debug(f"OpenAI流式生成完成，总共{chunk_count}个chunk")
+                )
+                try:
+                    async for chunk in upstream_stream:
+                        # 跳过被解析器过滤掉的不完整chunk（通常是tool_calls片段）
+                        if chunk is not None:
+                            chunk_count += 1
+                            # 将 OpenAI 响应对象转换为字符串格式
+                            bound_logger.debug(f"OpenAI event: {chunk}")
+                            yield f"{chunk}\n\n"
+                    bound_logger.debug(f"OpenAI流式生成完成，总共{chunk_count}个chunk")
+                finally:
+                    await upstream_stream.aclose()
 
             # 使用新的流式转换器
             bound_logger.info("开始流式转换")

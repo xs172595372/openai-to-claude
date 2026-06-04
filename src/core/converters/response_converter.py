@@ -471,3 +471,12 @@ class OpenAIToAnthropicConverter:
                 "message": {"type": "api_error", "message": str(error)},
             }
             yield format_event("error", error_event)
+        finally:
+            aclose = getattr(openai_stream, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception as close_error:
+                    bound_logger.warning(
+                        f"Failed to close OpenAI stream generator - Error: {str(close_error)}"
+                    )

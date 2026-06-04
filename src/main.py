@@ -43,7 +43,11 @@ async def lifespan(app: FastAPI):
             configure_logging(new_config.logging)
 
             # 重新创建消息处理器
-            app.state.messages_handler = await MessagesHandler.create(new_config)
+            old_handler = getattr(app.state, "messages_handler", None)
+            new_handler = await MessagesHandler.create(new_config)
+            app.state.messages_handler = new_handler
+            if old_handler is not None:
+                await old_handler.aclose()
 
             logger.info("配置热重载完成，服务已更新")
         except Exception as e:
@@ -68,6 +72,8 @@ async def lifespan(app: FastAPI):
     logger.info("正在停止配置文件监听...")
     if hasattr(app.state, "config_watcher"):
         app.state.config_watcher.stop_watching()
+    if hasattr(app.state, "messages_handler"):
+        await app.state.messages_handler.aclose()
     logger.info("服务器已停止")
 
 

@@ -30,6 +30,8 @@ class OpenAIServiceClient:
         base_url: str = "https://api.openai.com/v1",
         timeout: float | None = None,
         stream_read_timeout: float | None = None,
+        max_connections: int | None = None,
+        max_keepalive_connections: int | None = None,
     ):
         """Initialize OpenAI client with connection pool.
 
@@ -38,6 +40,8 @@ class OpenAIServiceClient:
             base_url: OpenAI API基础URL
             timeout: 请求超时时间(秒)
             stream_read_timeout: 流式响应两次读取之间的超时时间(秒)，None 表示不限制
+            max_connections: 连接池最大连接数
+            max_keepalive_connections: 连接池最大空闲连接数
         """
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -47,6 +51,13 @@ class OpenAIServiceClient:
             self.stream_read_timeout = self._get_timeout_from_env(
                 "STREAM_READ_TIMEOUT", default=None
             )
+        self.max_connections = max_connections or self._get_int_from_env(
+            "OPENAI_MAX_CONNECTIONS", 200
+        )
+        self.max_keepalive_connections = (
+            max_keepalive_connections
+            or self._get_int_from_env("OPENAI_MAX_KEEPALIVE_CONNECTIONS", 50)
+        )
 
         self.client = httpx.AsyncClient(
             headers={
@@ -56,6 +67,11 @@ class OpenAIServiceClient:
             },
             # 确保自动解压缩响应
             follow_redirects=True,
+            limits=httpx.Limits(
+                max_connections=self.max_connections,
+                max_keepalive_connections=self.max_keepalive_connections,
+                keepalive_expiry=30.0,
+            ),
             timeout=self.timeout,
         )
 
@@ -73,6 +89,19 @@ class OpenAIServiceClient:
             logger.warning(f"Invalid {env_name} value: {raw_value!r}, using {default}")
             return default
         return timeout if timeout > 0 else default
+
+    @staticmethod
+    def _get_int_from_env(env_name: str, default: int) -> int:
+        """Read a positive integer value from the environment."""
+        raw_value = os.getenv(env_name)
+        if raw_value is None or raw_value == "":
+            return default
+        try:
+            value = int(raw_value)
+        except ValueError:
+            logger.warning(f"Invalid {env_name} value: {raw_value!r}, using {default}")
+            return default
+        return value if value > 0 else default
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -175,6 +204,23 @@ class OpenAIServiceClient:
                     status_code=e.response.status_code,
                     message=response_body,
                     details={"type": "http_error"},
+                )
+            )
+
+        except httpx.PoolTimeout as e:
+            bound_logger.error(
+                f"OpenAI API connection pool timeout - Endpoint: {endpoint}, "
+                f"MaxConnections: {self.max_connections}, MaxKeepalive: {self.max_keepalive_connections}"
+            )
+            raise OpenAIClientError(
+                get_error_response(
+                    status_code=503,
+                    message=str(e),
+                    details={
+                        "type": "pool_timeout",
+                        "max_connections": self.max_connections,
+                        "max_keepalive_connections": self.max_keepalive_connections,
+                    },
                 )
             )
 
@@ -300,6 +346,22 @@ class OpenAIServiceClient:
                     status_code=e.response.status_code,
                     message=f"HTTP {e.response.status_code} error",
                     details={"type": "http_error"},
+                )
+            )
+
+        except httpx.PoolTimeout as e:
+            bound_logger.error(
+                f"OpenAI API 连接池超时 - MaxConnections: {self.max_connections}, MaxKeepalive: {self.max_keepalive_connections}"
+            )
+            raise OpenAIClientError(
+                get_error_response(
+                    status_code=503,
+                    message="Connection pool timeout",
+                    details={
+                        "type": "pool_timeout",
+                        "max_connections": self.max_connections,
+                        "max_keepalive_connections": self.max_keepalive_connections,
+                    },
                 )
             )
 
