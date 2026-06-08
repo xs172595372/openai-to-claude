@@ -11,19 +11,6 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from src.common.token_cache import get_cached_tokens
-
-from .stream_converters import (
-    StreamState,
-    _log_stream_completion_details,
-    format_event,
-    process_finish_event,
-    process_regular_content,
-    process_thinking_content,
-    process_tool_calls,
-    safe_json_parse,
-)
-
-
 from src.models.anthropic import (
     AnthropicContentBlock,
     AnthropicContentTypes,
@@ -38,6 +25,17 @@ from src.models.anthropic import (
 from src.models.openai import (
     OpenAIChoice,
     OpenAIMessage,
+)
+
+from .stream_converters import (
+    StreamState,
+    _log_stream_completion_details,
+    format_event,
+    process_finish_event,
+    process_regular_content,
+    process_thinking_content,
+    process_tool_calls,
+    safe_json_parse,
 )
 
 
@@ -301,10 +299,19 @@ class OpenAIToAnthropicConverter:
                     if state.has_finished:
                         break
 
-                    if not line.startswith("data: "):
+                    line = line.strip()
+                    if (
+                        not line
+                        or line.startswith("event:")
+                        or line.startswith(":")
+                    ):
                         continue
 
-                    data = line[6:]
+                    if line.startswith("data:"):
+                        data = line.removeprefix("data:").lstrip()
+                    else:
+                        data = line
+
                     if data == "[DONE]":
                         if not state.has_finished:
                             finish_events = process_finish_event(
@@ -352,7 +359,10 @@ class OpenAIToAnthropicConverter:
                             )
                             yield format_event(
                                 AnthropicStreamEventTypes.MESSAGE_START,
-                                message_start.model_dump(exclude=["delta", "usage"]),
+                                message_start.model_dump(
+                                    exclude={"delta", "usage"},
+                                    exclude_none=True,
+                                ),
                             )
 
                         choices = chunk_data.get("choices", [])

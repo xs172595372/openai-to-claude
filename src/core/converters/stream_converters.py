@@ -41,6 +41,9 @@ class StreamState:
         self.content_index = 0
         # 当前是否有已开始但未结束的内容块
         self.content_block_open = False
+        self.content_block_started = False
+        self.current_content_block_index: int | None = None
+        self.current_content_block_type: str | None = None
         self.buffer = ""
         # 思考内容模式 None 无 1 <think> 2 reasoning_content
         self.thinking_mode = None
@@ -98,6 +101,33 @@ def format_event(event_type: str, data: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _open_content_block(
+    state: StreamState, index: int, content_type: str
+) -> None:
+    state.content_block_open = True
+    state.content_block_started = True
+    state.current_content_block_index = index
+    state.current_content_block_type = content_type
+
+
+def _close_current_content_block(state: StreamState) -> list[str]:
+    if not state.content_block_open or state.current_content_block_index is None:
+        return []
+
+    index = state.current_content_block_index
+    content_block_stop = AnthropicStreamContentBlockStop(index=index)
+    state.content_block_open = False
+    state.current_content_block_index = None
+    state.current_content_block_type = None
+    state.content_index = max(state.content_index, index + 1)
+    return [
+        format_event(
+            AnthropicStreamEventTypes.CONTENT_BLOCK_STOP,
+            content_block_stop.model_dump(exclude_none=True),
+        )
+    ]
+
+
 def process_regular_content(delta: dict[str, Any], state: StreamState) -> list[str]:
     """处理普通文本内容"""
     events = []
@@ -106,11 +136,16 @@ def process_regular_content(delta: dict[str, Any], state: StreamState) -> list[s
     if not check_regular_content(delta, state):
         return events
 
-    if not state.content_started:
+    if (
+        not state.content_block_open
+        or state.current_content_block_type != AnthropicContentTypes.TEXT
+    ):
+        events.extend(_close_current_content_block(state))
         state.content_started = True
         state.has_text_content_started = True
+        content_index = state.content_index
         content_block_start = AnthropicStreamContentBlockStart(
-            index=state.content_index,
+            index=content_index,
             content_block=ContentBlock(
                 text="",
             ),
@@ -121,7 +156,7 @@ def process_regular_content(delta: dict[str, Any], state: StreamState) -> list[s
                 content_block_start.model_dump(exclude_none=True),
             )
         )
-        state.content_block_open = True
+        _open_content_block(state, content_index, AnthropicContentTypes.TEXT)
 
     # 累积内容用于token计算
     content = delta.get("content", "")
@@ -129,7 +164,7 @@ def process_regular_content(delta: dict[str, Any], state: StreamState) -> list[s
         state.accumulated_content.append(content)
 
     anthropic_chunk = AnthropicStreamContentBlock(
-        index=state.content_index,
+        index=state.current_content_block_index or 0,
         delta=Delta(
             type=AnthropicContentTypes.TEXT_DELTA,
             text=delta["content"],
@@ -151,9 +186,11 @@ def process_thinking_content(delta: dict[str, Any], state: StreamState) -> list[
     is_thinking = check_thinking_content(delta, state)
 
     if not state.thinking_started and is_thinking:
+        events.extend(_close_current_content_block(state))
         state.thinking_started = True
+        content_index = state.content_index
         content_block_start = AnthropicStreamContentBlockStart(
-            index=state.content_index,
+            index=content_index,
             content_block=ContentBlock(
                 type=AnthropicContentTypes.THINKING,
                 thinking="",
@@ -165,7 +202,7 @@ def process_thinking_content(delta: dict[str, Any], state: StreamState) -> list[
                 content_block_start.model_dump(exclude_none=True),
             )
         )
-        state.content_block_open = True
+        _open_content_block(state, content_index, AnthropicContentTypes.THINKING)
 
     # 提取思考内容
     thinking_content = None
@@ -186,7 +223,7 @@ def process_thinking_content(delta: dict[str, Any], state: StreamState) -> list[
         state.accumulated_content.append(thinking_content)
         # 处理普通思考内容
         thinking_chunk = AnthropicStreamContentBlock(
-            index=state.content_index,
+            index=state.current_content_block_index or 0,
             delta=Delta(
                 type=AnthropicContentTypes.THINKING_DELTA,
                 thinking=thinking_content,
@@ -199,13 +236,17 @@ def process_thinking_content(delta: dict[str, Any], state: StreamState) -> list[
             )
         )
 
-    if thinking_content is None and not state.thinking_finish:
+    if (
+        state.thinking_started
+        and thinking_content is None
+        and not state.thinking_finish
+    ):
         # 结束思考
         state.thinking_mode = None
         state.thinking_finish = True
         # signature_delta
         signature_delta = AnthropicStreamContentBlock(
-            index=state.content_index,
+            index=state.current_content_block_index or 0,
             delta=Delta(
                 type=AnthropicContentTypes.SIGNATURE_DELTA,
                 signature=f"{int(time.time() * 1000)}",
@@ -217,18 +258,7 @@ def process_thinking_content(delta: dict[str, Any], state: StreamState) -> list[
                 signature_delta.model_dump(exclude_none=True),
             )
         )
-        # content_block_stop
-        content_block_stop = AnthropicStreamContentBlockStop(
-            index=state.content_index,
-        )
-        events.append(
-            format_event(
-                AnthropicStreamEventTypes.CONTENT_BLOCK_STOP,
-                content_block_stop.model_dump(exclude_none=True),
-            )
-        )
-        state.content_block_open = False
-        state.content_index += 1
+        events.extend(_close_current_content_block(state))
         return events
     return events
 
@@ -247,26 +277,8 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
 
         # 处理新的工具调用
         if tool_call_index not in state.tool_call_index_to_content_block_index:
-            # 计算新的内容块索引
-            new_content_block_index = (
-                len(state.tool_call_index_to_content_block_index) + 1
-                if state.has_text_content_started
-                else len(state.tool_call_index_to_content_block_index)
-            )
-
-            # 如果不是第一个内容块，先结束上一个
-            if new_content_block_index != 0 and state.content_block_open:
-                content_block_stop = AnthropicStreamContentBlockStop(
-                    index=state.content_index,
-                )
-                events.append(
-                    format_event(
-                        AnthropicStreamEventTypes.CONTENT_BLOCK_STOP,
-                        content_block_stop.model_dump(exclude_none=True),
-                    )
-                )
-                state.content_block_open = False
-                state.content_index += 1
+            events.extend(_close_current_content_block(state))
+            new_content_block_index = state.content_index
 
             # 记录映射关系
             state.tool_call_index_to_content_block_index[tool_call_index] = (
@@ -288,7 +300,7 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
 
             # 创建内容块开始事件
             content_block_start = AnthropicStreamContentBlockStart(
-                index=state.content_index,
+                index=new_content_block_index,
                 content_block=ContentBlock(
                     type=AnthropicContentTypes.TOOL_USE,
                     id=tool_call_id,
@@ -302,7 +314,9 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
                     content_block_start.model_dump(exclude_none=True),
                 )
             )
-            state.content_block_open = True
+            _open_content_block(
+                state, new_content_block_index, AnthropicContentTypes.TOOL_USE
+            )
 
             # 保存工具调用信息
             state.tool_calls[tool_call_index] = {
@@ -337,8 +351,12 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
                 state.tool_calls[tool_call_index]["arguments"] += function_args
 
             try:
+                content_block_index = state.tool_calls.get(tool_call_index, {}).get(
+                    "content_block_index",
+                    state.current_content_block_index or 0,
+                )
                 anthropic_chunk = AnthropicStreamContentBlock(
-                    index=state.content_index,
+                    index=content_block_index,
                     delta=Delta(
                         type=AnthropicContentTypes.INPUT_JSON_DELTA,
                         partial_json=function_args,
@@ -357,13 +375,17 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
                 )
                 # 尝试修复参数格式
                 try:
+                    content_block_index = state.tool_calls.get(tool_call_index, {}).get(
+                        "content_block_index",
+                        state.current_content_block_index or 0,
+                    )
                     fixed_args = (
                         function_args.replace("\x00-\x1f\x7f-\x9f", "")
                         .replace("\\", "\\\\")
                         .replace('"', '\\"')
                     )
                     fixed_chunk = AnthropicStreamContentBlock(
-                        index=state.content_index,
+                        index=content_block_index,
                         delta=Delta(
                             type=AnthropicContentTypes.INPUT_JSON_DELTA,
                             partial_json=fixed_args,
@@ -394,17 +416,21 @@ def process_finish_event(
     state.has_finished = True
 
     # 只结束已经开始且仍然打开的内容块，避免生成非法的 stop-only 内容块序列。
-    if state.content_block_open:
-        content_block_stop = AnthropicStreamContentBlockStop(
-            index=state.content_index,
+    if not state.content_block_started:
+        content_index = state.content_index
+        content_block_start = AnthropicStreamContentBlockStart(
+            index=content_index,
+            content_block=ContentBlock(text=""),
         )
         events.append(
             format_event(
-                AnthropicStreamEventTypes.CONTENT_BLOCK_STOP,
-                content_block_stop.model_dump(exclude_none=True),
+                AnthropicStreamEventTypes.CONTENT_BLOCK_START,
+                content_block_start.model_dump(exclude_none=True),
             )
         )
-        state.content_block_open = False
+        _open_content_block(state, content_index, AnthropicContentTypes.TEXT)
+
+    events.extend(_close_current_content_block(state))
 
     # 映射停止原因
     stop_reason_mapping = {
